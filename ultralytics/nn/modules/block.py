@@ -1945,3 +1945,101 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+class RepConv(nn.Module):
+    """RepVGG Conv block: Training đa nhánh, Inference gộp thành 1."""
+    def __init__(self, c1, c2, k=3, s=1, p=None, g=1, act=True, deploy=False):
+        super().__init__()
+        self.deploy = deploy
+        self.groups = g
+        self.in_channels = c1
+        self.out_channels = c2
+        padding = k // 2 if p is None else p
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(c1, c2, k, s, padding, groups=g, bias=True)
+        else:
+            self.rbr_identity = nn.BatchNorm2d(num_features=c1) if c2 == c1 and s == 1 else None
+            self.rbr_dense = nn.Sequential(
+                nn.Conv2d(c1, c2, k, s, padding, groups=g, bias=False),
+                nn.BatchNorm2d(num_features=c2),
+            )
+            self.rbr_1x1 = nn.Sequential(
+                nn.Conv2d(c1, c2, 1, s, padding - k // 2, groups=g, bias=False),
+                nn.BatchNorm2d(num_features=c2),
+            )
+
+    def forward(self, inputs):
+        if hasattr(self, 'rbr_reparam'):
+            return self.act(self.rbr_reparam(inputs))
+        if self.rbr_identity is None:
+            id_out = 0
+        else:
+            id_out = self.rbr_identity(inputs)
+        return self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
+
+    def get_equivalent_kernel_bias(self):
+        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
+        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
+        kernelid, biasid = self._fuse_bn_tensor(self.rbr_identity)
+        return kernel3x3 + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid, bias3x3 + bias1x1 + biasid
+
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        if kernel1x1 is None: return 0
+        return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+
+    def _fuse_bn_tensor(self, branch):
+        if branch is None: return 0, 0
+        if isinstance(branch, nn.Sequential):
+            kernel = branch[0].weight
+            running_mean = branch[1].running_mean
+            running_var = branch[1].running_var
+            gamma = branch[1].weight
+            beta = branch[1].bias
+            eps = branch[1].eps
+        else:
+            assert isinstance(branch, nn.BatchNorm2d)
+            if not hasattr(self, 'id_tensor'):
+                input_dim = self.in_channels // self.groups
+                kernel_value = torch.zeros((self.in_channels, input_dim, 3, 3), dtype=branch.weight.dtype, device=branch.weight.device)
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_dim, 1, 1] = 1
+                self.id_tensor = kernel_value
+            kernel = self.id_tensor
+            running_mean = branch.running_mean
+            running_var = branch.running_var
+            gamma = branch.weight
+            beta = branch.bias
+            eps = branch.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def fuse(self):
+        if hasattr(self, 'rbr_reparam'): return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.rbr_reparam = nn.Conv2d(self.in_channels, self.out_channels, 3, 1, 1, groups=self.groups, bias=True)
+        self.rbr_reparam.weight.data = kernel
+        self.rbr_reparam.bias.data = bias
+        for para in self.parameters():
+            para.detach_()
+        if hasattr(self, 'rbr_dense'): self.__delattr__('rbr_dense')
+        if hasattr(self, 'rbr_1x1'): self.__delattr__('rbr_1x1')
+        if hasattr(self, 'rbr_identity'): self.__delattr__('rbr_identity')
+        if hasattr(self, 'id_tensor'): self.__delattr__('id_tensor')
+        self.deploy = True
+
+class RepC3(nn.Module):
+    """CSP Bottleneck with RepConv."""
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        # QUAN TRỌNG: 2 * c_ để khớp với output của torch.cat
+        self.cv3 = Conv(2 * c_, c2, 1) 
+        self.m = nn.Sequential(*(RepConv(c_, c_, 3, 1, g=g) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
